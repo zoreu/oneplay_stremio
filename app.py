@@ -44,14 +44,16 @@ PROXY_MAX_RETRIES = 7
 PROXY_RETRY_DELAY = 0.5
 
 M3U8_CACHE = {}
-M3U8_CACHE_TTL = 2  # segundos
+M3U8_CACHE_TTL = 2
 
 CHANNEL_CACHES = {}
 MP4_CACHES = {}
 IMG_CACHE = {}
+CATEGORY_MAP = {}
 CACHE_LOCK = threading.Lock()
 STREAM_LOCK = threading.Lock()
 IMG_CACHE_LOCK = threading.Lock()
+CATEGORY_LOCK = threading.Lock()
 
 SSL_CONTEXT = ssl.create_default_context()
 SSL_CONTEXT.check_hostname = False
@@ -362,6 +364,83 @@ def clean_text(text):
     return re.sub(r'[^a-z0-9]', '', text)
 
 
+def slugify_category(name):
+    """
+    Converte um nome de categoria em um slug seguro para URL/hostname.
+    Remove acentos, espaços e caracteres especiais. Mantém apenas [a-zA-Z0-9_-].
+    """
+    if not name:
+        return ''
+
+    text = name.lower()
+
+    accents = {
+        'à': 'a', 'á': 'a', 'â': 'a', 'ã': 'a', 'ä': 'a', 'å': 'a', 'æ': 'ae', 'ç': 'c',
+        'è': 'e', 'é': 'e', 'ê': 'e', 'ë': 'e', 'ì': 'i', 'í': 'i', 'î': 'i', 'ï': 'i',
+        'ð': 'd', 'ñ': 'n', 'ò': 'o', 'ó': 'o', 'ô': 'o', 'õ': 'o', 'ö': 'o', 'ø': 'o',
+        'ù': 'u', 'ú': 'u', 'û': 'u', 'ü': 'u', 'ý': 'y', 'þ': 'th', 'ÿ': 'y'
+    }
+    for k, v in accents.items():
+        text = text.replace(k, v)
+
+    text = re.sub(r'[^a-z0-9]+', '-', text)
+    text = text.strip('-')
+
+    return text or 'cat'
+
+
+def build_category_map(cats):
+    """
+    Constrói um mapa slug -> nome original da categoria.
+    Chamado sempre que as categorias são listadas.
+    """
+    mapping = {}
+    for cat in cats:
+        cat_name = cat.get('category_name') or cat.get('name') or ''
+        if not cat_name:
+            continue
+        slug = slugify_category(cat_name)
+        mapping[slug] = cat_name
+    return mapping
+
+
+def resolve_category(genre, content_type):
+    """
+    Recebe um slug (ou nome original) e devolve o nome real da categoria.
+    Consulta o cache global e, se não encontrar, atualiza.
+    """
+    if not genre:
+        return None
+
+    cache_key = content_type
+
+    with CATEGORY_LOCK:
+        mapping = CATEGORY_MAP.get(cache_key)
+
+    if not mapping:
+        if content_type == 'movie':
+            cat_action = 'get_vod_categories'
+        elif content_type == 'series':
+            cat_action = 'get_series_categories'
+        else:
+            cat_action = 'get_live_categories'
+        cats = xc_request(cat_action)
+        mapping = build_category_map(cats)
+        with CATEGORY_LOCK:
+            CATEGORY_MAP[cache_key] = mapping
+
+    if genre in mapping:
+        return mapping[genre]
+
+    for slug, original in mapping.items():
+        if slug.lower() == genre.lower():
+            return original
+        if original.lower() == genre.lower():
+            return original
+
+    return genre
+
+
 def build_stream_url(content_type, stream_id, episode_id=None):
     if content_type == 'movie':
         url = f"{XC_HOST}/movie/{XC_USERNAME}/{XC_PASSWORD}/{stream_id}.mp4"
@@ -570,9 +649,14 @@ def manifest_root():
     series_cats = xc_request('get_series_categories')
     live_cats = xc_request('get_live_categories')
 
-    movie_genres = [c.get('category_name') for c in movie_cats if c.get('category_name')]
-    series_genres = [c.get('category_name') for c in series_cats if c.get('category_name')]
-    live_genres = [c.get('category_name') for c in live_cats if c.get('category_name')]
+    with CATEGORY_LOCK:
+        CATEGORY_MAP['movie'] = build_category_map(movie_cats)
+        CATEGORY_MAP['series'] = build_category_map(series_cats)
+        CATEGORY_MAP['tv'] = build_category_map(live_cats)
+
+    movie_genres = list(CATEGORY_MAP['movie'].keys())
+    series_genres = list(CATEGORY_MAP['series'].keys())
+    live_genres = list(CATEGORY_MAP['tv'].keys())
 
     return jsonify({
         'id': ADDON_ID,
@@ -680,6 +764,8 @@ def catalog(content_type, catalog_id, extra=None):
     if not search:
         search = request.args.get('search', '')
 
+    real_genre = resolve_category(genre, content_type) if genre else ''
+
     if content_type == 'movie':
         action = 'get_vod_streams'
         cat_action = 'get_vod_categories'
@@ -703,12 +789,14 @@ def catalog(content_type, catalog_id, extra=None):
             if cleaned in clean_text(name):
                 metas.append(map_item(item, content_type))
                 count += 1
-    elif genre:
+    elif real_genre:
         cats = xc_request(cat_action)
         cat_id = None
         for cat in cats:
             cat_name = cat.get('category_name', '')
-            if cat_name == genre or cat_name.lower() == genre.lower() or clean_text(cat_name) == clean_text(genre):
+            if (cat_name == real_genre
+                    or cat_name.lower() == real_genre.lower()
+                    or clean_text(cat_name) == clean_text(real_genre)):
                 cat_id = cat.get('category_id')
                 break
         if cat_id:
