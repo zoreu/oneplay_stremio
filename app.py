@@ -451,12 +451,15 @@ def build_stream_url(content_type, stream_id, episode_id=None):
     else:
         url = f"{XC_HOST}/series/{XC_USERNAME}/{XC_PASSWORD}/{stream_id}.mp4"
 
-    if F4M_PROXY:
-        return f"{F4M_PROXY}/?url={quote(url, safe='')}"
+    # if F4M_PROXY:
+    #     return f"{F4M_PROXY}/?url={quote(url, safe='')}"
 
     try:
-        base = get_base_url()
-        return f"{base}/proxy/?url={quote(url, safe='')}"
+        if content_type == 'tv':
+            base = get_base_url()
+            return f"{base}/proxy/?url={quote(url, safe='')}"
+        else:
+            return url
     except RuntimeError:
         return url
 
