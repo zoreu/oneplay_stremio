@@ -667,7 +667,7 @@ def manifest_root():
         'version': ADDON_VERSION,
         'description': ADDON_DESCRIPTION,
         'logo': ICON_URL,
-        'idPrefixes': ['oneplay'],
+        'idPrefixes': ['oneplay', 'tt', 'tmdb'],
         'types': ['movie', 'series', 'tv'],
         'resources': ['catalog', 'meta', 'stream'],
         'behaviorHints': {
@@ -967,8 +967,520 @@ def meta(content_type, id):
     return jsonify({'meta': meta_data})
 
 
+# ========== BUSCA DE STREAMS POR IMDB ID (portado do index.js) ==========
+
+TMDB_API_KEY = _d("MTg2NWY0M2EwNTQ5Y2E1MGQzNDFkZDlhYjhiMjlmNDk=")
+TMDB_BASE_URL = 'https://api.themoviedb.org/3'
+
+STREAM_MAX_RESULTS = 5
+STREAM_MAX_CANDIDATES = 8
+STREAM_MIN_MATCH_SCORE = 0.85
+STREAM_CACHE_TTL = 600
+TMDB_CACHE_TTL = 86400
+XTREAM_CATALOG_TTL = 600
+DETAIL_CONCURRENCY = 3
+
+STREAM_CACHE = {}
+TMDB_CACHE = {}
+XTREAM_CATALOG_CACHE = {}
+IMDB_SEARCH_LOCK = threading.Lock()
+
+QUALITY_EMOJIS = {'4K': '👑', 'FHD': '💫', 'HD': '✨', 'SD': '📺', 'CAM': '🎥'}
+QUALITY_LABELS = {
+    '4K': '4K Ultra HD',
+    'FHD': 'Full HD 1080p',
+    'HD': 'HD 720p',
+    'SD': '1080p',
+    'CAM': 'CAM'
+}
+QUALITY_ORDER = {'4K': 4, 'FHD': 3, 'HD': 2, 'SD': 1, 'CAM': 0}
+
+
+def cache_get(cache_obj, key, ttl):
+    entry = cache_obj.get(key)
+    if entry and (time.time() - entry[1]) < ttl:
+        return entry[0]
+    return None
+
+
+def cache_set(cache_obj, key, data):
+    with IMDB_SEARCH_LOCK:
+        if len(cache_obj) > 2000:
+            cache_obj.clear()
+        cache_obj[key] = (data, time.time())
+
+
+def normalize_text(text):
+    if not text:
+        return ''
+    text = text.lower()
+    accents = {
+        'á': 'a', 'à': 'a', 'â': 'a', 'ã': 'a', 'ä': 'a',
+        'é': 'e', 'è': 'e', 'ê': 'e', 'ë': 'e',
+        'í': 'i', 'ì': 'i', 'î': 'i', 'ï': 'i',
+        'ó': 'o', 'ò': 'o', 'ô': 'o', 'õ': 'o', 'ö': 'o',
+        'ú': 'u', 'ù': 'u', 'û': 'u', 'ü': 'u',
+        'ç': 'c', 'ñ': 'n'
+    }
+    for k, v in accents.items():
+        text = text.replace(k, v)
+    text = re.sub(r'[^\w\s]', ' ', text)
+    text = re.sub(r'\s+', ' ', text).strip()
+    return text
+
+
+def calculate_similarity(text1, text2):
+    norm1 = normalize_text(text1)
+    norm2 = normalize_text(text2)
+    tokens1 = norm1.split(' ')
+    tokens2 = norm2.split(' ')
+    set1 = set(tokens1)
+    set2 = set(tokens2)
+    intersection = set1 & set2
+    union = set1 | set2
+    if not union:
+        return 0
+    jaccard = len(intersection) / len(union)
+    matches = 0
+    min_len = min(len(norm1), len(norm2))
+    for i in range(min_len):
+        if norm1[i] == norm2[i]:
+            matches += 1
+    sequence_sim = matches / max(len(norm1), len(norm2))
+    return (jaccard * 0.7) + (sequence_sim * 0.3)
+
+
+def extract_title_from_name(name):
+    title = re.sub(r'\s*(?:HD|FHD|4K|CAM|HDCAM|TS|WEB|WEB-DL|BluRay|DVD|HDRip|BDRip|480p|720p|1080p|2160p)\s*',
+                   ' ', name, flags=re.IGNORECASE)
+    title = re.sub(r'\s*[\[\(]\d{4}[\]\)]\s*', ' ', title)
+    title = re.sub(r'\s*S\d{1,2}E\d{1,2}\s*', ' ', title, flags=re.IGNORECASE)
+    title = re.sub(r'\s*Temporada\s*\d+\s*', ' ', title, flags=re.IGNORECASE)
+    title = re.sub(r'\s*Epis[oó]dio\s*\d+\s*', ' ', title, flags=re.IGNORECASE)
+    title = re.sub(r'\s*\(\d{4}\)\s*', ' ', title)
+    title = re.sub(r'\s*-\s*.*$', ' ', title)
+    title = re.sub(r'\s*\[\]\s*', ' ', title)
+    title = re.sub(r'\s*\[.*?\]\s*', ' ', title)
+    title = re.sub(r'\s*\[L\]\s*', ' ', title, flags=re.IGNORECASE)
+    title = re.sub(r'\s*-\s*L\s*', ' ', title, flags=re.IGNORECASE)
+    title = re.sub(r'\s*\(L\)\s*', ' ', title, flags=re.IGNORECASE)
+    return title.strip()
+
+
+def extract_year_from_name(name):
+    match = re.search(r'[\[\(](\d{4})[\]\)]', name)
+    return match.group(1) if match else ''
+
+
+def extract_quality(name):
+    name_lower = name.lower()
+    if re.search(r'4k|2160', name_lower):
+        return '4K'
+    if re.search(r'fhd|full hd|1080', name_lower):
+        return 'FHD'
+    if re.search(r'hd|720', name_lower):
+        return 'HD'
+    if re.search(r'cam|hdcam|cinema|ts', name_lower):
+        return 'CAM'
+    return 'SD'
+
+
+def is_subtitled(name):
+    name_lower = name.lower()
+    if re.search(r'\[l\]', name_lower):
+        return True
+    if re.search(r'-\s*l\b', name_lower):
+        return True
+    if re.search(r'\(l\)', name_lower):
+        return True
+    if re.search(r'legendado', name_lower):
+        return True
+    return False
+
+
+def get_video_quality_from_info(info):
+    if not info:
+        return 'SD'
+    video = info.get('video') or {}
+    width = video.get('width') or 0
+    height = video.get('height') or 0
+    if width >= 3840 or height >= 2160:
+        return '4K'
+    if width >= 1920 or height >= 1080:
+        return 'FHD'
+    if width >= 1280 or height >= 720:
+        return 'HD'
+    if width > 0 and height > 0:
+        return 'SD'
+    return 'SD'
+
+
+def get_movie_search_terms(title, original_title):
+    terms = {}
+    if title:
+        normalized_title = title.strip()
+        terms[normalized_title.lower()] = {
+            'term': normalized_title, 'weight': 1.0, 'source': 'title_pt'
+        }
+        no_accent = normalize_text(normalized_title)
+        if no_accent != normalized_title.lower():
+            terms[no_accent] = {
+                'term': no_accent, 'weight': 0.98, 'source': 'title_pt_normalized'
+            }
+    if original_title and original_title != title:
+        normalized_original = original_title.strip()
+        terms[normalized_original.lower()] = {
+            'term': normalized_original, 'weight': 0.95, 'source': 'title_en'
+        }
+    return sorted(terms.values(), key=lambda t: t['weight'], reverse=True)
+
+
+def calculate_match_score(stream_title, stream_year, search_term, target_year):
+    normalized_stream = normalize_text(stream_title)
+    normalized_search = normalize_text(search_term['term'])
+
+    if target_year and stream_year and str(target_year) != str(stream_year):
+        return 0
+
+    year_bonus = 0
+    if target_year and not stream_year:
+        year_bonus = -0.1
+    elif target_year and stream_year and str(target_year) == str(stream_year):
+        year_bonus = 0.05
+
+    if len(normalized_search) < 3:
+        return 0
+
+    if normalized_stream == normalized_search:
+        return min(1.0, 1.0 + year_bonus)
+
+    stream_words = [w for w in normalized_stream.split(' ') if len(w) > 2]
+    search_words = [w for w in normalized_search.split(' ') if len(w) > 2]
+
+    if search_words and stream_words:
+        all_found = True
+        for s_word in search_words:
+            if not any(t_word == s_word for t_word in stream_words):
+                all_found = False
+                break
+        if all_found:
+            extra_words = len(stream_words) - len(search_words)
+            if extra_words == 0:
+                return min(0.97, 0.97 + year_bonus)
+            if extra_words <= 1:
+                return min(0.92, 0.92 + year_bonus)
+
+    similarity = calculate_similarity(normalized_search, normalized_stream)
+    if similarity > 0.7:
+        return min(0.85, 0.7 + (similarity - 0.7) * 0.5 + year_bonus)
+
+    return 0
+
+
+def get_tmdb_info(imdb_id, media_type):
+    is_series = media_type in ('tv', 'series')
+    cache_key = f"tmdb_{imdb_id}_{media_type}"
+
+    cached = cache_get(TMDB_CACHE, cache_key, TMDB_CACHE_TTL)
+    if cached is not None:
+        return cached
+
+    final_id = None
+    if str(imdb_id).startswith('tt'):
+        try:
+            find_resp = requests.get(
+                f"{TMDB_BASE_URL}/find/{imdb_id}",
+                params={
+                    'api_key': TMDB_API_KEY,
+                    'external_source': 'imdb_id',
+                    'language': 'pt-BR'
+                },
+                headers=HEADERS,
+                timeout=8,
+                verify=False
+            )
+            find_data = find_resp.json() if find_resp.status_code == 200 else None
+        except Exception:
+            find_data = None
+
+        if find_data:
+            if is_series:
+                results = find_data.get('tv_results') or []
+                if not results:
+                    results = find_data.get('movie_results') or []
+            else:
+                results = find_data.get('movie_results') or []
+                if not results:
+                    results = find_data.get('tv_results') or []
+            if results:
+                final_id = results[0].get('id')
+
+        if not final_id:
+            return None
+    else:
+        final_id = imdb_id
+
+    endpoint = 'tv' if is_series else 'movie'
+    try:
+        detail_resp = requests.get(
+            f"{TMDB_BASE_URL}/{endpoint}/{final_id}",
+            params={'api_key': TMDB_API_KEY, 'language': 'pt-BR'},
+            headers=HEADERS,
+            timeout=8,
+            verify=False
+        )
+        data = detail_resp.json() if detail_resp.status_code == 200 else None
+    except Exception:
+        data = None
+
+    if not data:
+        return None
+
+    if is_series:
+        result = {
+            'title': data.get('name') or '',
+            'year': (data.get('first_air_date') or '')[:4],
+            'type': 'series',
+            'tmdb_id': data.get('id'),
+            'original_title': data.get('original_name') or '',
+            'overview': data.get('overview') or ''
+        }
+    else:
+        result = {
+            'title': data.get('title') or '',
+            'year': (data.get('release_date') or '')[:4],
+            'type': 'movie',
+            'tmdb_id': data.get('id'),
+            'original_title': data.get('original_title') or '',
+            'overview': data.get('overview') or ''
+        }
+
+    cache_set(TMDB_CACHE, cache_key, result)
+    return result
+
+
+def get_xcatalog(action):
+    cache_key = f"{XC_USERNAME}:{action}"
+    cached = cache_get(XTREAM_CATALOG_CACHE, cache_key, XTREAM_CATALOG_TTL)
+    if cached is not None:
+        return cached
+
+    data = xc_request(action)
+    if isinstance(data, list) and data:
+        cache_set(XTREAM_CATALOG_CACHE, cache_key, data)
+        return data
+    return []
+
+
+def search_movie_streams(title, year, original_title):
+    search_terms = get_movie_search_terms(title, original_title)
+    data = get_xcatalog('get_vod_streams')
+
+    if not data or not search_terms:
+        return []
+
+    matches = []
+    for stream in data:
+        name = stream.get('name') or ''
+        if not name:
+            continue
+        stream_title = extract_title_from_name(name)
+        stream_year = extract_year_from_name(name)
+        best_score = 0
+        for search_term in search_terms:
+            score = calculate_match_score(stream_title, stream_year, search_term, year)
+            if score > best_score:
+                best_score = score
+        if best_score >= STREAM_MIN_MATCH_SCORE:
+            stream_id = stream.get('stream_id')
+            if stream_id:
+                matches.append({
+                    'name': name,
+                    'title': stream_title,
+                    'year': stream_year,
+                    'quality': extract_quality(name),
+                    'id': stream_id,
+                    'similarity': best_score,
+                    'subtitled': is_subtitled(name)
+                })
+
+    matches.sort(key=lambda m: m['similarity'], reverse=True)
+    return matches
+
+
+def search_series_streams(title, year, original_title):
+    search_terms = get_movie_search_terms(title, original_title)
+    data = get_xcatalog('get_series')
+
+    if not data or not search_terms:
+        return []
+
+    matches = []
+    for stream in data:
+        name = stream.get('name') or ''
+        if not name:
+            continue
+        stream_title = extract_title_from_name(name)
+        stream_year = extract_year_from_name(name)
+        best_score = 0
+        for search_term in search_terms:
+            score = calculate_match_score(stream_title, stream_year, search_term, year)
+            if score > best_score:
+                best_score = score
+        if best_score >= STREAM_MIN_MATCH_SCORE:
+            series_id = stream.get('series_id')
+            if series_id:
+                matches.append({
+                    'name': name,
+                    'title': stream_title,
+                    'year': stream_year,
+                    'quality': extract_quality(name),
+                    'id': series_id,
+                    'similarity': best_score,
+                    'subtitled': is_subtitled(name)
+                })
+
+    matches.sort(key=lambda m: m['similarity'], reverse=True)
+    return matches
+
+
+def find_episode(series_info, season, episode):
+    episodes = (series_info or {}).get('episodes') or {}
+    season_eps = episodes.get(str(season)) or episodes.get(int(season)) or []
+    for ep in season_eps:
+        if str(ep.get('episode_num')) == str(episode):
+            return ep
+    return None
+
+
+def create_formatted_title(title, year, quality, is_series, season, episode, subtitled):
+    quality_emoji = QUALITY_EMOJIS.get(quality, '📺')
+    quality_label = QUALITY_LABELS.get(quality, quality)
+    sub_tag = ' [LEGENDADO]' if subtitled else ''
+
+    display_title = title
+    if is_series and season and episode:
+        display_title = f"{title} S{int(season):02d}E{int(episode):02d}"
+
+    return (f"{quality_emoji} {display_title}{sub_tag} ({year or '????'})\n"
+            f"⚡ OnePlay\n🎯 {quality_label}")
+
+
+def imdb_get_streams(imdb_id, media_type, season=None, episode=None):
+    is_series = media_type == 'series'
+    season_num = int(season) if season else 1
+    episode_num = int(episode) if episode else 1
+
+    cache_key = f"{imdb_id}_{media_type}_{season_num}_{episode_num}"
+    cached = cache_get(STREAM_CACHE, cache_key, STREAM_CACHE_TTL)
+    if cached is not None:
+        return cached
+
+    tmdb_info = get_tmdb_info(imdb_id, media_type)
+    if not tmdb_info:
+        cache_set(STREAM_CACHE, cache_key, [])
+        return []
+
+    title = tmdb_info.get('title') or ''
+    year = tmdb_info.get('year') or ''
+    original_title = tmdb_info.get('original_title') or ''
+
+    if is_series:
+        matches = search_series_streams(title, year, original_title)
+    else:
+        matches = search_movie_streams(title, year, original_title)
+
+    if not matches:
+        cache_set(STREAM_CACHE, cache_key, [])
+        return []
+
+    matches.sort(key=lambda m: (QUALITY_ORDER.get(m['quality'], 0), m['similarity']), reverse=True)
+
+    seen_ids = set()
+    unique_matches = []
+    for match in matches[:STREAM_MAX_CANDIDATES]:
+        if match['id'] in seen_ids:
+            continue
+        seen_ids.add(match['id'])
+        unique_matches.append(match)
+
+    def build_stream_entry(match):
+        try:
+            quality = match['quality']
+
+            if is_series:
+                detail = xc_request('get_series_info', {'series_id': match['id']})
+                ep = find_episode(detail, season_num, episode_num)
+                if not ep:
+                    return None
+                ep_quality = get_video_quality_from_info(ep.get('info'))
+                if ep_quality != 'SD':
+                    quality = ep_quality
+                stream_url = build_stream_url('series', match['id'], ep.get('id'))
+            else:
+                stream_url = build_stream_url('movie', match['id'])
+
+            if not stream_url:
+                return None
+
+            formatted_title = create_formatted_title(
+                title, year, quality, is_series,
+                season_num, episode_num, match.get('subtitled', False)
+            )
+            return {
+                'name': ADDON_NAME,
+                'title': formatted_title,
+                'url': stream_url,
+                'behaviorHints': {
+                    'notWebReady': True,
+                    'bingeGroup': f"oneplay-{'series' if is_series else 'movie'}:{imdb_id}"
+                }
+            }
+        except Exception:
+            return None
+
+    if is_series:
+        from concurrent.futures import ThreadPoolExecutor
+        with ThreadPoolExecutor(max_workers=DETAIL_CONCURRENCY) as executor:
+            built = list(executor.map(build_stream_entry, unique_matches))
+    else:
+        built = [build_stream_entry(m) for m in unique_matches]
+
+    streams = [b for b in built if b][:STREAM_MAX_RESULTS]
+
+    if streams:
+        cache_set(STREAM_CACHE, cache_key, streams)
+
+    return streams
+
+
 @app.route('/stream/<content_type>/<id>.json')
 def stream(content_type, id):
+    raw_id = (id or '').strip()
+
+    if raw_id.startswith('tt') or raw_id.lower().startswith('tmdb:'):
+        season = request.args.get('season')
+        episode = request.args.get('episode')
+
+        parts = raw_id.split(':')
+        if parts[0].lower() == 'tmdb':
+            content_id = parts[1] if len(parts) > 1 else ''
+            if len(parts) > 2:
+                season = parts[2]
+            if len(parts) > 3:
+                episode = parts[3]
+        else:
+            content_id = parts[0]
+            if len(parts) > 1:
+                season = parts[1]
+            if len(parts) > 2:
+                episode = parts[2]
+
+        if content_type in ('movie', 'series') and content_id:
+            streams = imdb_get_streams(content_id, content_type, season, episode)
+            return jsonify({'streams': streams, 'cacheMaxAge': STREAM_CACHE_TTL})
+        return jsonify({'streams': []})
+
     parts = id.split(':')
     if len(parts) < 3:
         return jsonify({'streams': []})
@@ -1220,9 +1732,3 @@ def handle_mp4_proxy(url, cache, range_header, method):
 @app.route('/<path:path>')
 def catch_all(path):
     return jsonify({'error': 'Rota não encontrada'}), 404
-
-
-if __name__ == '__main__':
-    import urllib3
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-    app.run(host='0.0.0.0', port=5000, debug=True)
